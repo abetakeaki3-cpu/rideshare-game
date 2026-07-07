@@ -2485,8 +2485,8 @@ function draw(){
     if(!p.active)continue;
     const [sx,sy]=cellXY(p.active.cell),[x,y]=cellXY(p.active.dest);
     // 駒→目的地のガイド線(本人は濃く、敵は薄く色分け)
-    ctx.strokeStyle=p.color;ctx.globalAlpha=p.isHuman?0.55:0.4;
-    ctx.lineWidth=p.isHuman?2.6:1.8;ctx.setLineDash(p.isHuman?[2,6]:[5,5]);
+    ctx.strokeStyle=p.color;ctx.globalAlpha=isLocalTurn(p.i)?0.55:0.4;
+    ctx.lineWidth=isLocalTurn(p.i)?2.6:1.8;ctx.setLineDash(isLocalTurn(p.i)?[2,6]:[5,5]);
     ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(x,y);ctx.stroke();
     ctx.setLineDash([]);ctx.globalAlpha=1;
     // 目的地リング+旗
@@ -2498,7 +2498,7 @@ function draw(){
     if(_fim){const _fs=C*1.2; ctx.drawImage(_fim, x-_fs*0.5, y-_fs*0.88, _fs, _fs);}
     else{ctx.font=(C*0.5)+'px sans-serif';ctx.fillText('🚩',x,y-C*0.52);}
     // 誰の目的地か(色つきピル)
-    const nm=p.isHuman?'あなた':p.name;
+    const nm=isLocalTurn(p.i)?'あなた':p.name;
     ctx.font='bold '+Math.max(8,C*0.2)+'px sans-serif';
     const tw=ctx.measureText(nm).width,pw=tw+C*0.2,ph=Math.max(9,C*0.28);
     const ly=Math.min(S-ph/2-1,y+C*0.55);
@@ -2779,9 +2779,9 @@ function renderPlayers(){
       const d=walkDistUI(p.active.cell,p.active.dest);
       cur=`<span class="sm">「${p.active.card.name}」${d>=0?`🎯あと${d}`:''}</span>`;
     }
-    return `<div class="pchip${p.isHuman?' me':''}${p.i===TURN_PI?' turn':''}" data-pi="${p.i}" style="border-color:${p.color}">
+    return `<div class="pchip${isLocalTurn(p.i)?' me':''}${p.i===TURN_PI?' turn':''}" data-pi="${p.i}" style="border-color:${p.color}">
       ${(typeof CARD_IMG!=='undefined'&&CARD_IMG['rank_'+rank])?`<span class="rkbadge"><img src="${CARD_IMG['rank_'+rank]}"><b>${rank}</b></span>`:`<span class="rk r${rank}">${rank}位</span>`}
-      <b style="color:${p.color}">${p.isHuman?'👤':''}${p.name}</b>
+      <b style="color:${p.color}">${isLocalTurn(p.i)?'👤':''}${p.name}</b>
       <span class="score">${p.usedPts}<span style="color:#7f8ca3;font-weight:normal">/${goal}</span></span>
       <span class="goalbar"><i style="width:${frac}%"></i></span>
       ${stackHTML(p.actionHand.length,'act')}
@@ -2794,7 +2794,7 @@ async function showPlayerDetail(pi){
   const p=G.players[pi];
   if(p.active)inspectPlayer(pi,true);
   const goal=G.goalPts||18;
-  let body=`<div class="ptitle" style="color:${p.color}">${p.isHuman?'👤':''}${p.name} <span style="font-size:12px;color:#9fb2cc">(現在${(currentRanking(G).indexOf(p)+1)}位)</span></div>
+  let body=`<div class="ptitle" style="color:${p.color}">${isLocalTurn(p.i)?'👤':''}${p.name} <span style="font-size:12px;color:#9fb2cc">(現在${(currentRanking(G).indexOf(p)+1)}位)</span></div>
    <div class="sm" style="font-size:12.5px;line-height:1.9">
    🏅 スコア: <b>${p.usedPts} / ${goal}点</b>(到着キャラの得点合計。先に${goal}点で勝ち)<br>
    🏁 到着ずみ: <b>${p.journeys}人</b><br>
