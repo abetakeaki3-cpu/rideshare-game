@@ -3646,7 +3646,7 @@ async function enterOnlineMatch(cfg, seat){
     allowTraits:M.allowTraits, allowActions:M.allowActions, noActions:M.noActions,
     destPool:M.destPool, aiNoise:0, drawLuck:0, goalPts:M.goalPts||18 });
   G.destMode=cfg.dmode; G.setupMode=cfg.smode; G.mode=cfg.mode; G.online=true;
-  HUMAN=seat; CV.zoom=1;
+  HUMAN=seat; CV.zoom=1; HINTS_ON=false; // オンラインはヒント無効(hintOnceのブロッキングでHAND_ACTION未設定=スワイプ不可を防ぐ)
   show('screen-game'); setupCanvas(); refresh();
   // 相手からの同期照合を受け取るハンドラ
   NET._handlers['sync']=(m)=>{ if(NET._mySync) showSyncResult(NET._mySync, m.rep); else NET._pendingSync=m.rep; };
