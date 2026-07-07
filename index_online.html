@@ -3191,25 +3191,24 @@ async function runDraft(){
 async function gameLoop(){
   while(!G.winner){
     saveGame(); // ターン境界で自動セーブ(タイトルの「つづきから」で再開可)
+    netTurnSync(); // ターン境界の同期照合(online)
     for(const pi of turnOrder(G)){
       const p=G.players[pi];
       if(!(p.needsPlacement&&p.usedPts<(G.goalPts||18)&&p.charHand.length>0&&p.dests.some((d,i)=>!p.usedDests.includes(i))))continue;
-      if(p.isHuman)await humanPlace(pi);
-      else{
-        const pl=aiPlace(G,pi);placeCharacter(G,pi,pl.charId,pl.house,pl.destIdx);
-        const cc=p.usedChars[p.usedChars.length-1];
-        if(cc)await cardFX(charCardHTML(cc),p.name+'のキャラが出発',p.color);
-      }
+      const pl=await decideData(pi,'place'+G.turn, ()=>humanPlace(pi), ()=>aiPlace(G,pi));
+      placeCharacter(G,pi,pl.charId,pl.house,pl.destIdx);
+      const cc=p.usedChars[p.usedChars.length-1];
+      if(cc && !isLocalTurn(pi))await cardFX(charCardHTML(cc),p.name+'のキャラが出発',p.color);
       refresh();
     }
     if(G.noActions){setStatus(`ターン${G.turn} 移動フェイズ`);await phaseBanner(`ターン ${G.turn} ─ 🚶 移動`);}else{
     setStatus(`ターン${G.turn} アクションフェイズ`);
     await phaseBanner(`ターン ${G.turn} ─ 🃏 アクション`);
     const choices={};
-    for(const pi of turnOrder(G)){
-      const p=G.players[pi];
-      choices[pi]=p.isHuman?await humanAction(pi):aiChooseAction(G,pi);
-    }
+    // 同時選択(隠し札の公平性): 各自ローカルはUI・相手は受信を並列で
+    await Promise.all(turnOrder(G).map(pi=>
+      decideData(pi,'act'+G.turn, ()=>humanAction(pi), ()=>aiChooseAction(G,pi)).then(v=>{choices[pi]=v;})
+    ));
     const played=Object.entries(choices).filter(([pi,c])=>c.cardId);
     if(played.length){setStatus('アクション同時公開！');await phaseBanner('🃏 同時公開!');}
     const gen=actionPhaseGen(G,choices);
@@ -3224,9 +3223,9 @@ async function gameLoop(){
       const ev=r.value;
       if(ev.type==='target'){
         await showFX(ev.pi,ev.card);
-        let target;
-        if(G.players[ev.pi].isHuman)target=await humanTarget(ev.pi,ev.card,ev.revealed);
-        else{const preset=choices[ev.pi]&&choices[ev.pi].target;target=preset||aiActionTarget(G,ev.pi,ev.card,ev.revealed);}
+        const target=await decideData(ev.pi,'tgt'+G.turn+'_'+ev.card.id,
+          ()=>humanTarget(ev.pi,ev.card,ev.revealed),
+          ()=>((choices[ev.pi]&&choices[ev.pi].target)||aiActionTarget(G,ev.pi,ev.card,ev.revealed)));
         refresh();
         r=gen.next(target);
       }else if(ev.type==='resolved'){
@@ -3245,6 +3244,7 @@ async function gameLoop(){
     }
     for(const pi of turnOrder(G)){
       const p=G.players[pi];
+      const localTurn=isLocalTurn(pi);
       const nMoves=(p.fx.nikaiTurn===G.turn)?2:1;
       if(p.active){
         TURN_PI=pi;renderPlayers();
@@ -3252,46 +3252,28 @@ async function gameLoop(){
           // 「とばされた感」対策: なぜ動けないかをちゃんと見せる
           const a=p.active;
           let why='今回は移動できません';
-          if(p.fx.frozenTurn===G.turn)why=`「お疲れ様！！」の効果で、${p.isHuman?'あなたの':p.name+'の'}「${a.card.name}」は今回おやすみ 💤`;
+          if(p.fx.frozenTurn===G.turn)why=`「お疲れ様！！」の効果で、${localTurn?'あなたの':p.name+'の'}「${a.card.name}」は今回おやすみ 💤`;
           else if(a.card.trait==='chikoku'&&G.turn<a.placedTurn+2)why=`遅刻魔「${a.card.name}」はまだ寝ています(移動できるまであと${a.placedTurn+2-G.turn}ターン)`;
-          if(p.isHuman)await autoNotice(`<div class="ptitle">💤 移動スキップ</div><div class="sm" style="font-size:13px;line-height:1.8">${why}</div>`,2400);
+          if(localTurn)await autoNotice(`<div class="ptitle">💤 移動スキップ</div><div class="sm" style="font-size:13px;line-height:1.8">${why}</div>`,2400);
           else{setStatus(`${p.name}: 移動スキップ(${a.card.tname})`);await sleep(900);}
           camFollowMode=false;camReset();TURN_PI=-1;renderPlayers();
           continue;
         }
-        camFollowMode=!p.isHuman;
-        camFocusCell(p.active.cell, p.isHuman?1.7:2.0);
-        if(p.isHuman){await phaseBanner('▶ あなたの番'); await sleep(300); camReset();}
+        camFollowMode=!localTurn;
+        camFocusCell(p.active.cell, localTurn?1.7:2.0);
+        if(localTurn){await phaseBanner('▶ あなたの番'); await sleep(300); camReset();}
         else setStatus(`${p.name}の移動…`);
       }
       for(let mi=0;mi<nMoves;mi++){
         if(!p.active)break;
-        if(p.isHuman)await humanMove(pi);
-        else{
-          const mv=aiMove(G,pi);
-          if(mv){
-            // 何をするか一言(自動送り/タップで早送り)
-            let msg;
-            if(mv.declare){msg=`🎉 「${p.active.card.name}」が目的地 <b>${p.active.destLabel}</b> に到着!`;}
-            else{
-              const dst=landmarkDesc(G.board,mv.move.cell);
-              const rem=walkDistUI(mv.move.cell,p.active.dest);
-              msg=`「${p.active.card.name}」が${modeName(mv.move.mode)}で <b>${dst}</b> へ`+(rem>0?` (目的地まであと約${rem}マス)`:'');
-            }
-            await enemyNotice(p,msg);
-            if(mv.declare){const dc=p.active.dest;declareArrive(G,pi);onArrive(p,dc);}
-            else{
-              await animateMove(mv.move,pi);
-              const evs=applyMove(G,pi,mv.move,mv.payment);
-              if(evs.some(e=>e.type==='arrive'))onArrive(p,mv.move.cell);
-            }
-          } else { await enemyNotice(p,`ここは<b>動かず待機</b>(パス)`,1200); break; }
-        }
+        const mv=await decideData(pi,'mv'+G.turn+'_'+mi, ()=>humanMove(pi), ()=>aiMove(G,pi));
+        const res=await applyMoveDescriptor(pi, mv, localTurn);
         refresh();
+        if(res==='pass')break;
       }
       TURN_PI=-1;renderPlayers();
       camFollowMode=false;
-      if(!p.isHuman){await sleep(300);camReset();}
+      if(!localTurn){await sleep(300);camReset();}
       await sleep(360);
     }
     // 終了フェイズ: アクションカードは最大5枚(超過分は自動で捨てる)
@@ -3333,8 +3315,7 @@ async function humanPlace(pi){
     const c=await pickCell(unused.map(x=>x.d.cell),'目的地をタップして選ぶ',false,labels);
     di=unused.find(x=>x.d.cell===c).i;
   }
-  placeCharacter(G,pi,ch.id,house,di);
-  refresh();
+  return {charId:ch.id, house, destIdx:di};
 }
 
 // ---- アクション選択 ----
@@ -3394,6 +3375,7 @@ async function humanTarget(pi,card,revealed){
 // ---- 移動 ----
 async function humanMove(pi){
   const p=G.players[pi],a=p.active;
+  const _rngS=G.rng.s; // ヒント等でrngを消費しても最後に巻き戻す(決定論維持)
   startPulse();
   try{
   await hintOnce('move','移動フェイズ',
@@ -3420,7 +3402,7 @@ async function humanMove(pi){
     setStatus(info);
     items.push({label:'💡 おすすめを見る',sub:'AIが良さそうな一手を提案',value:'hint'});
     const v=await panelChoose('移動: '+info,items);
-    if(v==='pass')return;
+    if(v==='pass')return null;
     if(v==='waitinfo'){
       await modal(`<div class="ptitle">🚏 バス・電車の乗り方</div><div class="sm" style="font-size:13px;line-height:1.9">
         バス停・駅に<b>前のターンからいる</b>と乗れます。<br><br>
@@ -3458,7 +3440,7 @@ async function humanMove(pi){
       }
       continue;
     }
-    if(v==='arrive'){const dc=p.active.dest,tr0=p.active.card.trait;declareArrive(G,pi);ACH_GAME.traits.push(tr0);onArrive(p,dc);refresh();return;}
+    if(v==='arrive'){return {declare:true};}
     const list=byMode[v];
     const cellMap=new Map(list.map(m=>[m.cell,m]));
     const c=await pickCell([...cellMap.keys()],names[v]+': 行き先をタップ',true);
@@ -3484,24 +3466,9 @@ async function humanMove(pi){
       payment=await panelChoose(((typeof CARD_IMG!=='undefined'&&CARD_IMG.ticket_ride)?`<img class="tkt" src="${CARD_IMG.ticket_ride}">`:'')+'配車コストを選ぶ',items2);
       if(!payment)continue;
     }
-    const trBefore=a.card.trait;
-    if(mv.mode==='ride')ACH_GAME.ride=true;
-    if(mv.mode==='warp')ACH_GAME.warp=true;
-    dbg('選'+mv.cell+' '+mv.mode);
-    try{ await animateMove(mv,pi); }catch(e){ dbg('animERR:'+e.message); }
-    ANIM=null;
-    let evs=[];
-    try{ evs=applyMove(G,pi,mv,payment); }catch(e){ dbg('applyERR:'+e.message); }
-    dbg('移動→'+(p.active?p.active.cell:'着'));
-    if(evs.some(e=>e.type==='arrive')){ACH_GAME.traits.push(trBefore);onArrive(p,mv.cell);}
-    refresh();
-    if(p.active&&G.board.stations.includes(p.active.cell))
-      await hintOnce('stawait','🚉 駅に到着!','ここで1ターン待つ(=次の移動フェイズで動かない or 今ターンはこれで終了)と、次のターンに🚃電車に乗れます。<br>駒の下の「⏳待機中…」が「乗れる!」に変わったら出発OK。');
-    else if(p.active&&G.board.busStopCells.includes(p.active.cell))
-      await hintOnce('buswait','🚏 バス停に到着!','ここで1ターン待つと、次のターンに🚌バスで2駅先まで一気に移動できます。<br>駒の下の「⏳待機中…」が「乗れる!」に変わったら出発OK。');
-    return;
+    return {move:mv, payment};
   }
-  }finally{stopPulse();}
+  }finally{stopPulse(); G.rng.s=_rngS;}
 }
 
 async function showResult(){
@@ -3683,6 +3650,7 @@ async function enterOnlineMatch(cfg, seat){
   show('screen-game'); setupCanvas(); refresh();
   // 相手からの同期照合を受け取るハンドラ
   NET._handlers['sync']=(m)=>{ if(NET._mySync) showSyncResult(NET._mySync, m.rep); else NET._pendingSync=m.rep; };
+  NET._handlers['tsync']=(m)=>{ const mine=NET._turnMine; if(mine&&mine.turn===m.turn) netTurnCompare(mine.rep, m.rep); else NET._turnPending=m; };
   netOverlay(`✅ 接続OK / あなたは <b>${seat===0?'ホスト(先手側)':'ゲスト(後手側)'}</b><br><span class="sm">準備フェーズを始めます…(家→目的地の指名→ドラフト)</span>`);
   try{
     await runSetup();
@@ -3715,6 +3683,51 @@ async function netDecide(pi, tag, localFn){
   }
 }
 
+// online: そのpiが自分の操作担当か(表示切替用)。offline: isHuman
+function isLocalTurn(pi){ return netOnline()? (pi===NET.seat) : !!(G.players[pi]&&G.players[pi].isHuman); }
+// 移動記述子を適用(local/remote/CPU共通)。localTurn=自分の番か。返り値'pass'なら以降の移動を打ち切る
+async function applyMoveDescriptor(pi, mv, localTurn){
+  const p=G.players[pi];
+  if(!mv){ if(!localTurn) await enemyNotice(p,`ここは<b>動かず待機</b>(パス)`,1200); return 'pass'; }
+  if(!localTurn){
+    let msg;
+    if(mv.declare){ msg=`🎉 「${p.active.card.name}」が目的地 <b>${p.active.destLabel}</b> に到着!`; }
+    else{ const dst=landmarkDesc(G.board,mv.move.cell); const rem=walkDistUI(mv.move.cell,p.active.dest);
+      msg=`「${p.active.card.name}」が${modeName(mv.move.mode)}で <b>${dst}</b> へ`+(rem>0?` (目的地まであと約${rem}マス)`:''); }
+    await enemyNotice(p,msg);
+  }
+  if(mv.declare){ const dc=p.active.dest, tr0=p.active.card.trait; declareArrive(G,pi); ACH_GAME.traits.push(tr0); onArrive(p,dc); }
+  else{
+    const trBefore=p.active?p.active.card.trait:'';
+    if(mv.move.mode==='ride')ACH_GAME.ride=true;
+    if(mv.move.mode==='warp')ACH_GAME.warp=true;
+    try{ await animateMove(mv.move,pi); }catch(e){}
+    ANIM=null;
+    let evs=[]; try{ evs=applyMove(G,pi,mv.move,mv.payment); }catch(e){}
+    if(evs.some(e=>e.type==='arrive')){ ACH_GAME.traits.push(trBefore); onArrive(p,mv.move.cell); }
+    if(localTurn && p.active){
+      if(G.board.stations.includes(p.active.cell))
+        await hintOnce('stawait','🚉 駅に到着!','ここで1ターン待つ(=次の移動フェイズで動かない or 今ターンはこれで終了)と、次のターンに🚃電車に乗れます。<br>駒の下の「⏳待機中…」が「乗れる!」に変わったら出発OK。');
+      else if(G.board.busStopCells.includes(p.active.cell))
+        await hintOnce('buswait','🚏 バス停に到着!','ここで1ターン待つと、次のターンに🚌バスで2駅先まで一気に移動できます。<br>駒の下の「⏳待機中…」が「乗れる!」に変わったら出発OK。');
+    }
+  }
+  return 'moved';
+}
+// ターン境界の同期照合(online, 不一致時のみ警告)
+function netTurnSync(){
+  if(!netOnline()) return;
+  const rep=syncReport(), turn=G.turn;
+  NET._turnMine={turn, rep};
+  netSendRaw({t:'tsync', turn, rep});
+  const pend=NET._turnPending;
+  if(pend && pend.turn===turn){ netTurnCompare(rep, pend.rep); NET._turnPending=null; }
+}
+function netTurnCompare(mine, other){
+  const parts=['rng','house','dest','hand','deck'];
+  const diffs=parts.filter(k=>mine[k]!==other[k]);
+  if(diffs.length) netOverlay(`❌ ターン同期ズレ: <b style="color:#ff6b6b">${diffs.join(' / ')}</b><br><span class="sm">この単語を開発者に伝えてください</span>`);
+}
 // ---- 準備フェーズ用: 決定データを取得(online=local UI→送信 / remote=受信, offline=human/ai) ----
 async function decideData(pi, tag, humanFn, aiFn){
   if(netOnline()){
