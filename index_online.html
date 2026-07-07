@@ -3571,7 +3571,42 @@ function netOpenLocal(code){
   catch(e){ alert('この環境はオンライン対戦(BroadcastChannel)に未対応です'); return; }
   NET.ch.onmessage = (e)=> netHandle(e.data);
 }
-function netSendRaw(msg){ if(NET.mode==='local' && NET.ch) NET.ch.postMessage(msg); }
+// ===== Firebase(別端末対戦)トランスポート: 設定を入れるとクラウド中継で別端末どうし対戦可能 =====
+const FIREBASE_CONFIG = { // ← 別端末対戦ON(Firebase中継)。設定を消すと同一ブラウザ2タブのみに戻る。
+  apiKey: "AIzaSyA9w0IQfEAZKaSp6q1jf39IYl8JqeSyhaQ",
+  authDomain: "rideshare-game-17d00.firebaseapp.com",
+  databaseURL: "https://rideshare-game-17d00-default-rtdb.firebaseio.com",
+  projectId: "rideshare-game-17d00",
+  storageBucket: "rideshare-game-17d00.firebasestorage.app",
+  messagingSenderId: "694402236117",
+  appId: "1:694402236117:web:862a3a15f72f8e72d5ec5c"
+};
+const _fbId = Math.random().toString(36).slice(2);
+let _fbInited=false, _fbRef=null;
+function netUseFirebase(){ return !!FIREBASE_CONFIG; }
+function loadFirebaseSDK(){
+  return new Promise((resolve,reject)=>{
+    if(typeof firebase!=='undefined' && firebase.database){ resolve(); return; }
+    const urls=['https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js','https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js'];
+    let i=0;
+    const next=()=>{ if(i>=urls.length) return resolve(); const s=document.createElement('script'); s.src=urls[i++]; s.onload=next; s.onerror=()=>reject(new Error('Firebase SDKの読み込みに失敗')); document.head.appendChild(s); };
+    next();
+  });
+}
+async function netOpenFirebase(code){
+  await loadFirebaseSDK();
+  if(!_fbInited){ firebase.initializeApp(FIREBASE_CONFIG); _fbInited=true; }
+  _fbRef = firebase.database().ref('rooms/'+code+'/msgs');
+  _fbRef.on('child_added', (snap)=>{ const m=snap.val(); if(!m||m.from===_fbId) return; try{ netHandle(m.data); }catch(e){} });
+}
+async function netOpen(code){
+  if(netUseFirebase()){ NET.mode='firebase'; await netOpenFirebase(code); }
+  else { NET.mode='local'; netOpenLocal(code); }
+}
+function netSendRaw(msg){
+  if(NET.mode==='local' && NET.ch){ NET.ch.postMessage(msg); return; }
+  if(NET.mode==='firebase' && _fbRef){ _fbRef.push({from:_fbId, data:msg}); return; }
+}
 function netHandle(msg){
   if(!msg || !msg.t) return;
   if(msg.t==='decision'){
@@ -3607,32 +3642,35 @@ async function openOnlineLobby(){
     [{label:'部屋を作る(ホスト)',value:'host',cls:'primary'},
      {label:'部屋に入る(ゲスト)',value:'join'},
      {label:'やめる',value:0}]);
-  if(v==='host') hostRoom();
-  else if(v==='join') joinRoom();
+  if(v==='host') await hostRoom();
+  else if(v==='join') await joinRoom();
 }
 function newRoomCode(){ return (''+(1000+Math.floor(Math.random()*9000))); }
-function hostRoom(){
+async function hostRoom(){
   const code=newRoomCode();
-  NET.mode='local'; NET.code=code; NET.seat=0; NET.isHost=true;
+  NET.code=code; NET.seat=0; NET.isHost=true;
   NET.cfg={ seed:(Math.floor(Math.random()*1e9)), size:15, mode:'hard', dmode:'pick', smode:'manual' };
-  netOpenLocal(code);
   NET._handlers['join']=()=>{
     netSendRaw({t:'config',cfg:NET.cfg});
     if(!(G&&G.online)) enterOnlineMatch(NET.cfg,0);
   };
+  netOverlay('接続中…');
+  try{ await netOpen(code); }catch(e){ netOverlay('⚠ 接続失敗: '+(e&&e.message)); return; }
   netOverlay(`あいことば <b style="font-size:30px;color:#4fc3f7;letter-spacing:3px">${code}</b><br>
-    <span class="sm">相手にこの4桁を伝え、「部屋に入る」で入力してもらってください。<br>相手が入ると自動で開始します。</span>`);
+    <span class="sm">相手にこの4桁を伝え、「部屋に入る」で入力してもらってください。<br>相手が入ると自動で開始します。</span>${netUseFirebase()?'<br><span class="sm" style="color:#7fe0a0">🌐 別端末モード(Firebase)</span>':''}`);
 }
 async function joinRoom(){
   const code=(window.prompt('あいことば(4桁)を入力','')||'').trim();
   if(!code) return;
-  NET.mode='local'; NET.code=code; NET.seat=1; NET.isHost=false;
-  netOpenLocal(code);
+  NET.code=code; NET.seat=1; NET.isHost=false;
   NET._handlers['config']=(m)=>{ if(!(G&&G.online)){ NET.cfg=m.cfg; enterOnlineMatch(m.cfg,1); } };
+  netOverlay(`あいことば <b>${code}</b> に接続中…`);
+  try{ await netOpen(code); }catch(e){ netOverlay('⚠ 接続失敗: '+(e&&e.message)); return; }
   netOverlay(`あいことば <b>${code}</b> に接続中…<br><span class="sm">ホストの開始を待っています</span>`);
   netSendRaw({t:'join'});
-  setTimeout(()=>netSendRaw({t:'join'}),300);
-  setTimeout(()=>netSendRaw({t:'join'}),1000);
+  setTimeout(()=>netSendRaw({t:'join'}),500);
+  setTimeout(()=>netSendRaw({t:'join'}),1500);
+  setTimeout(()=>netSendRaw({t:'join'}),3000);
 }
 
 // ---- 対局開始(両端末で同一シードから同じ初期状態を作る) ----
