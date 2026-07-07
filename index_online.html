@@ -3662,6 +3662,9 @@ async function enterOnlineMatch(cfg, seat){
     netSendRaw({t:'sync', rep:NET._mySync});
     if(NET._pendingSync){ showSyncResult(NET._mySync, NET._pendingSync); NET._pendingSync=null; }
     else netOverlay(`準備完了 / あなた=<b>${seat===0?'ホスト':'ゲスト'}</b><br><span class="sm">相手と状態を照合しています…</span>`);
+    // 対戦ターン開始(1.5秒だけ同期結果を見せてから)
+    await sleep(1500); netOverlayOff();
+    gameLoop();
   }catch(e){ netOverlay('⚠ エラー: '+(e&&e.message)); throw e; }
 }
 
