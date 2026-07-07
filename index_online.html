@@ -3177,9 +3177,10 @@ async function runDraft(){
     <div class="sm">7枚の束から1枚選び、残りを隣へ回します(×7回)。<br>盤面の緑の点線◯があなたの目的地です。家と目的地への行きやすさを考えて選ぼう。</div>${mySetupSummary()}`,[{label:'OK',value:1}]);
   for(let r=0;r<7;r++){
     const picks={};
-    for(let pi=0;pi<G.players.length;pi++){
-      picks[pi]=await decideData(pi,'draft'+r, ()=>uiDraftPick(pi,r), ()=>aiDraftPick(G,pi,G.draftPacks[pi]));
-    }
+    // 同時選択: 自分はUI・相手は受信を並列で(交互待ちを解消)
+    await Promise.all(G.players.map((_,pi)=>
+      decideData(pi,'draft'+r, ()=>uiDraftPick(pi,r), ()=>aiDraftPick(G,pi,G.draftPacks[pi])).then(v=>{picks[pi]=v;})
+    ));
     draftPickAll(G,picks);
     refresh();
   }
@@ -3564,7 +3565,38 @@ const NET = {
   inbox:{}, waiters:{}, _handlers:{}
 };
 function netOnline(){ return NET.mode!=='off'; }
-function strHash(s){ let h=5381; for(let i=0;i<s.length;i++) h=((h*33)^s.charCodeAt(i))>>>0; return ('00000000'+h.toString(16)).slice(-8); }
+function strHash(s){ s=String(s); let h=5381; for(let i=0;i<s.length;i++) h=((h*33)^s.charCodeAt(i))>>>0; return ('00000000'+h.toString(16)).slice(-8); }
+// 準備完了時に双方のゲーム状態を部分ごとにハッシュ化(logは除外=表示のみで状態でないため)
+function syncReport(){
+  const P=G.players; const h=(x)=>strHash(JSON.stringify(x));
+  return {
+    rng:  h(G.rng&&G.rng.s),
+    house:h(P.map(p=>p.houses||[])),
+    dest: h(P.map(p=>(p.dests||[]).map(d=>d.cell))),
+    hand: h(P.map(p=>[(p.charHand||[]).map(c=>c.id),(p.actionHand||[]).map(c=>c.id)])),
+    deck: h([(G.charDeck||[]).map(c=>c.id),(G.actionDeck||[]).map(c=>c.id)])
+  };
+}
+function showSyncResult(mine, other){
+  const parts=['rng','house','dest','hand','deck'];
+  const diffs=parts.filter(k=>mine[k]!==other[k]);
+  if(diffs.length===0){
+    netOverlay(`✅ <b style="color:#4fc3f7;font-size:18px">同期成功！</b><br><span class="sm">両端末のゲーム状態が完全一致しました(乱数・家・目的地・手札・山札)。この土台の上に対戦ターンを実装できます。</span>`);
+  }else{
+    netOverlay(`❌ <b style="color:#ff6b6b;font-size:18px">不一致</b>: 食い違い→ <b>${diffs.join(' / ')}</b><br><span class="sm">この赤字の部分名を私(開発者)に伝えてください。原因を特定して直します。</span>`);
+  }
+}
+// online用「おまかせ」: G.rngを使わず(Math.random)有効なマスを選ぶ。結果は送信されるので決定論に影響しない
+function autoPickHomes(pi, taken){
+  const pool=G.board.houses.filter(h=>!taken.has(h)); const out=[];
+  for(let k=0;k<3&&pool.length;k++) out.push(pool.splice(Math.floor(Math.random()*pool.length),1)[0]);
+  return out;
+}
+function autoPickDests(pi, taken){
+  const pool=destCandidates(G).filter(d=>!taken.has(d.cell)); const out=[]; const n=destCount(G);
+  for(let k=0;k<n&&pool.length;k++) out.push(pool.splice(Math.floor(Math.random()*pool.length),1)[0]);
+  return out;
+}
 
 // ---- トランスポート(ローカル: 別タブ) ----
 function netOpenLocal(code){
@@ -3649,14 +3681,19 @@ async function enterOnlineMatch(cfg, seat){
   G.destMode=cfg.dmode; G.setupMode=cfg.smode; G.mode=cfg.mode; G.online=true;
   HUMAN=seat; CV.zoom=1;
   show('screen-game'); setupCanvas(); refresh();
+  // 相手からの同期照合を受け取るハンドラ
+  NET._handlers['sync']=(m)=>{ if(NET._mySync) showSyncResult(NET._mySync, m.rep); else NET._pendingSync=m.rep; };
   netOverlay(`✅ 接続OK / あなたは <b>${seat===0?'ホスト(先手側)':'ゲスト(後手側)'}</b><br><span class="sm">準備フェーズを始めます…(家→目的地の指名→ドラフト)</span>`);
   try{
     await runSetup();
     await runDraft();
     if(!G.noActions) dealActions(G);
     refresh();
-    const cs=strHash(gameToJSON(G));
-    netOverlay(`✅ 準備完了 / あなた=<b>${seat===0?'ホスト':'ゲスト'}</b><br>同期チェック <b style="color:#4fc3f7">${cs}</b><br><span class="sm">両方の画面でこの符号が一致すれば、準備フェーズの同期は成功です。<br>次のステップで対戦ターン(配置・アクション・移動)をつなぎます。</span>`);
+    // 準備完了: 双方のゲーム状態を自動照合(logは無視)
+    NET._mySync = syncReport();
+    netSendRaw({t:'sync', rep:NET._mySync});
+    if(NET._pendingSync){ showSyncResult(NET._mySync, NET._pendingSync); NET._pendingSync=null; }
+    else netOverlay(`準備完了 / あなた=<b>${seat===0?'ホスト':'ゲスト'}</b><br><span class="sm">相手と状態を照合しています…</span>`);
   }catch(e){ netOverlay('⚠ エラー: '+(e&&e.message)); throw e; }
 }
 
@@ -3691,13 +3728,11 @@ async function decideData(pi, tag, humanFn, aiFn){
 // 家3軒を選ぶUI(online時はおまかせ無し=手動のみ:乱数を消費しないため) → [cell,cell,cell]
 async function uiPickHomes(pi, taken){
   const p=G.players[pi];
-  let mode='manual';
-  if(!netOnline()){
-    mode=await panelChoose('自分の家を3軒選びます',[
-      {label:'自分で選ぶ',sub:'盤面から3軒タップ',value:'manual'},
-      {label:'おまかせ',sub:'AIが便利な場所を選ぶ',value:'auto'}]);
-  }
-  if(mode==='auto') return aiSetup(G,pi,taken).houses;
+  if(netOnline()) netOverlay('🏠 あなたの番: 自分の家を3軒えらびます');
+  const mode=await panelChoose('自分の家を3軒選びます',[
+    {label:'自分で選ぶ',sub:'盤面から3軒タップ',value:'manual'},
+    {label:'おまかせ',sub:'自動でえらぶ',value:'auto'}]);
+  if(mode==='auto') return netOnline()? autoPickHomes(pi,taken) : aiSetup(G,pi,taken).houses;
   const houses=[];
   for(let k=0;k<3;k++){
     const free=G.board.houses.filter(h=>!taken.has(h)&&!houses.includes(h));
@@ -3709,13 +3744,11 @@ async function uiPickHomes(pi, taken){
 // (pi+1)の目的地を指名するUI → dests[]
 async function uiPickDests(pi, taken){
   const nxt=G.players[(pi+1)%G.players.length];
-  let mode='manual';
-  if(!netOnline()){
-    mode=await panelChoose(`${nxt.name}の目的地を${destCount(G)}つ指名します(意地悪に選ぼう)`,[
-      {label:'自分で選ぶ',sub:'盤面からタップ(駅・特殊施設・バス停・空き家)',value:'manual'},
-      {label:'おまかせ',value:'auto'}]);
-  }
-  if(mode==='auto') return aiSetup(G,pi,taken).dests;
+  if(netOnline()) netOverlay(`🎯 あなたの番: 相手(${nxt.name})の目的地を${destCount(G)}つ指名(意地悪に！)`);
+  const mode=await panelChoose(`${nxt.name}の目的地を${destCount(G)}つ指名します(意地悪に選ぼう)`,[
+    {label:'自分で選ぶ',sub:'盤面からタップ(駅・特殊施設・バス停・空き家)',value:'manual'},
+    {label:'おまかせ',value:'auto'}]);
+  if(mode==='auto') return netOnline()? autoPickDests(pi,taken) : aiSetup(G,pi,taken).dests;
   const dests=[];
   for(let k=0;k<destCount(G);k++){
     const cands=destCandidates(G).filter(d=>!taken.has(d.cell)&&!dests.some(x=>x.cell===d.cell));
