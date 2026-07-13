@@ -254,10 +254,6 @@ body{margin:0;background:var(--bg);color:var(--txt);font-family:'Hiragino Sans',
     <label><input type="radio" name="smode" value="auto" checked><span>おまかせ</span></label>
     <label><input type="radio" name="smode" value="manual"><span>自分で選ぶ(原作)</span></label>
   </div>
-  <div class="opt" id="opt-dmode"><div class="olabel">目的地の決め方</div>
-    <label><input type="radio" name="dmode" value="pick" checked><span>相手が指名(原作)</span></label>
-    <label><input type="radio" name="dmode" value="random"><span>ランダム</span></label>
-  </div>
   <div class="opt"><div class="olabel">サウンド</div>
     <label><input type="checkbox" id="chk-bgm"><span>🎵 音楽</span></label>
     <label><input type="checkbox" id="chk-se"><span>🔔 効果音</span></label>
@@ -613,13 +609,14 @@ function newGame(opts){
       charHand:[], actionHand:[], houses:[], dests:[],
       usedHouses:[], usedDests:[], usedChars:[],
       journeys:0, usedPts:0, reachAnnounced:false, active:null, needsPlacement:true,
+      nextHome:null, finishRank:0,
       fx:{}, // 個別効果
     })),
     charDeck:shuffle(buildCharDeck(rng,opts.allowTraits),rng),
     actionDeck:shuffle(buildActionDeck(rng,opts.allowActions),rng),
     noActions:!!opts.noActions, destPool:opts.destPool||'all', aiNoise:opts.aiNoise||0, drawLuck:opts.drawLuck||0,
     goalPts:opts.goalPts||18,
-    actionDiscard:[], charDiscard:[],
+    actionDiscard:[], charDiscard:[], houseDeck:[], finishCounter:0,
     railDeck:shuffle([...RAIL_PATTERNS],rng),
     rail:null,
     turn:1, startPlayer:0, phase:'setup',
@@ -653,12 +650,42 @@ function destCandidates(G){
   }
   return out;
 }
-function autoAssignSetup(G,pi,houseCells,destPicks){
-  const p=G.players[pi];
-  p.houses=houseCells; // 3 cells
-  // destPicks は「次のプレイヤーの目的地」として登録
-  const nxt=G.players[(pi+1)%G.players.length];
-  nxt.dests=destPicks; // [{cell,label}]
+// ルールv6: 盤面四隅(に最も近い)の家。スタートの家ドラフト用
+function cornerHouses(B){
+  const corners=[CK(0,0),CK(B.W-1,0),CK(0,B.H-1),CK(B.W-1,B.H-1)];
+  const used=new Set(),out=[];
+  for(const cn of corners){
+    const [cx,cy]=cn.split(',').map(Number);
+    let best=null,bd=1e9;
+    for(const h of B.houses){
+      if(used.has(h))continue;
+      const [hx,hy]=h.split(',').map(Number);
+      const d=Math.abs(hx-cx)+Math.abs(hy-cy);
+      if(d<bd){bd=d;best=h;}
+    }
+    if(best){used.add(best);out.push(best);}
+  }
+  return out;
+}
+// ルールv6: 家カードの山札から1枚引く(次の目的地)
+function drawHouseCard(G,p){
+  const B=G.board;
+  if(!G.houseDeck)G.houseDeck=[];
+  const avoid=(p&&p.nextHome)||null; // 出発の家そのものは目的地にしない(即到着の防止)
+  let idx=G.houseDeck.findIndex(c=>c!==avoid);
+  if(idx<0){ // 山札切れ: 作り直す(所有・目的地使用中以外 → 足りなければ他人所有の家も対象)
+    const owned=new Set();for(const q of G.players)q.houses.forEach(h=>owned.add(h));
+    const act=new Set();
+    for(const q of G.players){q.dests.forEach((d,i)=>{if(!q.usedDests.includes(i))act.add(d.cell);});if(q.active)act.add(q.active.dest);}
+    let pool=B.houses.filter(h=>!owned.has(h)&&!act.has(h)&&h!==avoid);
+    if(!pool.length)pool=B.houses.filter(h=>!act.has(h)&&h!==avoid);
+    if(!pool.length)pool=B.houses.filter(h=>h!==avoid);
+    G.houseDeck=G.houseDeck.concat(shuffle(pool,G.rng));
+    idx=G.houseDeck.findIndex(c=>c!==avoid);
+  }
+  if(idx<0)return null;
+  const cell=G.houseDeck.splice(idx,1)[0];
+  return {cell,label:'家('+landmarkDesc(B,cell)+')',type:'house'};
 }
 
 // ---- ドラフト ----
@@ -679,7 +706,7 @@ function draftPickAll(G,picks){ // picks[pi]=cardId
   G.draftRound++;
   return G.draftRound>=7;
 }
-function dealActions(G){for(const p of G.players) for(let i=0;i<5;i++){const c=drawAction(G,p);if(c)p.actionHand.push(c);}}
+function dealActions(G){for(const p of G.players) for(let i=0;i<2;i++){const c=drawAction(G,p);if(c)p.actionHand.push(c);}} // ルールv6: 初期手札2枚
 function drawAction(G,p){
   if(G.actionDeck.length===0){
     if(G.actionDiscard.length===0) return null;
@@ -717,11 +744,13 @@ function neededReserve(G,p){ // 残り必要キャラ数(これ未満に手札�
   const need=Math.ceil(((G.goalPts||18)-p.usedPts)/5);
   return Math.max(0, need-(p.active?1:0));
 }
-function placeCharacter(G,pi,charId,houseCell,destIdx){
+function placeCharacter(G,pi,charId){
   const p=G.players[pi];
   const ci=p.charHand.findIndex(c=>c.id===charId);
   const card=p.charHand.splice(ci,1)[0];
+  const destIdx=p.dests.findIndex((_,i2)=>!p.usedDests.includes(i2));
   const dest=p.dests[destIdx];
+  const houseCell=p.nextHome||p.houses[0];
   p.usedDests.push(destIdx); p.usedChars.push(card); // 家は消費しない(何度でも出発可)
   p.active={card, cell:houseCell, home:houseCell, dest:dest.cell, destLabel:dest.label,
     cellSince:G.turn-1, usedVehicle:false, lastMode:null, leftVehicleTurn:-9,
@@ -1173,6 +1202,11 @@ function applyMove(G,pi,move,payment){
     const n=(a.card.trait==='rohisheki'&&f.key==='super')?2:1;
     gainActions(G,p,n); events.push({type:'specialDraw',n});
   }
+  // ルールv6: 別プレイヤーの所有する家に止まったら、その所有者がカードを1枚引く
+  if(B.houses.includes(a.cell)){
+    const q=G.players.find(q2=>q2.i!==pi&&q2.houses.includes(a.cell));
+    if(q&&!G.noActions){gainActions(G,q,1);log(G,`🏠 ${p.name}が${q.name}の家に止まった → ${q.name}が1枚引く`);events.push({type:'houseOwnerDraw',owner:q.i});}
+  }
   // 到着判定
   if(arrivalOk) arrive(G,pi,events);
   return events;
@@ -1214,8 +1248,20 @@ function arrive(G,pi,events){
   } else {
     gainActions(G,p,1); // ルール4: 到着で1枚ドロー
   }
+  // ルールv6: 到着した家を所有(先着1人)。次のキャラはこの家から出発し、次の目的地は家カードの山札から
+  const destCell=a.dest;
+  if(G.board.houses.includes(destCell)&&!G.players.some(q=>q.houses.includes(destCell))){
+    p.houses.push(destCell);
+    log(G,`🏠 ${p.name}が${fmtCell(destCell)}の家を所有した`);
+    events.push({type:'ownHouse',pi,cell:destCell});
+  }
+  p.nextHome=destCell;
   p.active=null;
-  if(p.usedPts<(G.goalPts||18)&&p.charHand.length>0&&p.dests.some((d,i)=>!p.usedDests.includes(i)))p.needsPlacement=true;
+  if(p.usedPts<(G.goalPts||18)&&p.charHand.length>0){
+    const nd=drawHouseCard(G,p);
+    if(nd){p.dests.push(nd);log(G,`🎯 ${p.name}の次の目的地: ${nd.label}`);}
+    if(p.dests.some((d,i)=>!p.usedDests.includes(i)))p.needsPlacement=true;
+  }
   events.push({type:'arrive',pi});
 }
 
@@ -1235,14 +1281,21 @@ function endPhaseDiscard(G,p){
 }
 function endTurn(G){
   const goal=G.goalPts||18;
-  // 勝利判定(合計18点以上。同一ターン複数達成は得点→到着順で比較)
-  const done=G.players.filter(p=>p.usedPts>=goal);
-  if(done.length>0){
-    done.sort((x,y)=>{
-      if(y.usedPts!==x.usedPts)return y.usedPts-x.usedPts;
-      return (x.arrivalTurnOrder||99)-(y.arrivalTurnOrder||99);
-    });
-    G.winner=done[0];
+  // ルールv6: 目標達成者は上位から順位確定。未達成が残り1人になったら終了
+  G.finishCounter=G.finishCounter||0;
+  const newly=G.players.filter(p=>p.usedPts>=goal&&!p.finishRank);
+  newly.sort((x,y)=>{
+    if(y.usedPts!==x.usedPts)return y.usedPts-x.usedPts;
+    return (x.arrivalTurnOrder||99)-(y.arrivalTurnOrder||99);
+  });
+  for(const p of newly){
+    p.finishRank=++G.finishCounter;
+    log(G,`🏁 ${p.name}が${goal}点を達成！(${p.finishRank}位確定)`);
+  }
+  const unfin=G.players.filter(p=>!p.finishRank);
+  if(unfin.length<=1){
+    if(unfin.length===1)unfin[0].finishRank=++G.finishCounter;
+    G.winner=G.players.find(p=>p.finishRank===1)||G.players[0];
     G.ranking=currentRanking(G);
     G.phase='over';
     log(G,`🏆 ${G.winner.name}の勝利！`);
@@ -1255,6 +1308,8 @@ function endTurn(G){
 // 現時点の順位(得点→到着数→到着順)。上位ほど前
 function currentRanking(G){
   return [...G.players].sort((x,y)=>{
+    const fx=x.finishRank||99, fy=y.finishRank||99;
+    if(fx!==fy)return fx-fy;
     if(y.usedPts!==x.usedPts)return y.usedPts-x.usedPts;
     if(y.journeys!==x.journeys)return y.journeys-x.journeys;
     return (x.arrivalTurnOrder||99)-(y.arrivalTurnOrder||99);
@@ -1290,6 +1345,7 @@ function* actionPhaseGen(G,choices){
   }
   // 実行しなかったプレイヤーは1枚引く
   for(const pi of turnOrder(G)){
+    if(G.players[pi].finishRank)continue;
     if(!choices[pi]||!choices[pi].cardId) gainActions(G,G.players[pi],1);
   }
 }
@@ -1301,9 +1357,9 @@ function* actionPhaseGen(G,choices){
 // フィールドはボード状態(道路/線路)が変わると無効化
 function estField(G,pi,destCell,opt){
   opt=opt||{};
-  const walkS=opt.walkS||2, rideS=opt.rideOk?5:0;
+  const walkS=opt.walkS||2, rideS=(opt.rideOk&&!opt.noVeh)?5:0, noVeh=!!opt.noVeh;
   G._fieldCache=G._fieldCache||{};
-  const key=destCell+'|'+walkS+'|'+rideS+'|'+pi+'|'+(G.boardStamp||0);
+  const key=destCell+'|'+walkS+'|'+rideS+'|'+(noVeh?'w':'v')+'|'+pi+'|'+(G.boardStamp||0);
   if(G._fieldCache[key])return G._fieldCache[key];
   const B=G.board;
   const dist={}; dist[destCell]=0;
@@ -1337,8 +1393,8 @@ function estField(G,pi,destCell,opt){
       if(st<=rideS&&canRideFrom(G,pi,b)){const nd=d+1;
         if(nd<(dist[b]??1e9)){dist[b]=nd;pq.push([nd,b]);}}
     }
-    // バス(対称)
-    const si=B.busStopCells.indexOf(c);
+    // バス(対称) — 乗り物に乗れない特徴では距離場に混ぜない
+    const si=noVeh?-1:B.busStopCells.indexOf(c);
     if(si>=0){const n=B.busStopCells.length;
       for(const dir of [1,-1])for(let h=1;h<=2;h++){
         const b=B.busStopCells[((si+dir*h)%n+n)%n];
@@ -1346,7 +1402,7 @@ function estField(G,pi,destCell,opt){
         if(nd<(dist[b]??1e9)){dist[b]=nd;pq.push([nd,b]);}
       }}
     // 電車(対称)
-    const ti=B.stations.indexOf(c);
+    const ti=noVeh?-1:B.stations.indexOf(c);
     if(ti>=0){for(const [u,v] of G.rail.edges){
       let o=-1; if(u===ti)o=v; else if(v===ti)o=u;
       if(o>=0){const b=B.stations[o],nd=d+1.5;
@@ -1398,37 +1454,7 @@ function bfsSteps(B,from,k){ // 互換API(遅い方)
   return res;
 }
 
-// --- セットアップ: 家3軒選び+次プレイヤーの目的地3つ指名 ---
-function aiSetup(G,pi,takenHouses){
-  const B=G.board;
-  const free=B.houses.filter(h=>!takenHouses.has(h));
-  const cands=destCandidates(G).filter(d=>!takenHouses.has(d.cell));
-  // 家の便利さ評価はハブ施設(駅+特殊)への近さで見る(高速化)
-  const hubs=cands.filter(d=>d.type==='station'||d.type==='special');
-  const scored=free.map(h=>{
-    let best=99;
-    for(const d of hubs)best=Math.min(best,estTurns(G,pi,h,d.cell,{rideOk:true}));
-    return {h,score:best+G.rng()*1.5};
-  }).sort((a,b)=>a.score-b.score);
-  const houses=scored.slice(0,3).map(s=>s.h);
-  // 相手への目的地: 候補からサンプリングして遠い所を選ぶ
-  const pool=[...cands];
-  shuffle(pool,G.rng);
-  const sample=pool.slice(0,Math.min(20,pool.length));
-  const destScored=sample.map(d=>{
-    let sum=0;
-    for(const h of houses)sum+=estTurns(G,pi,h,d.cell,{rideOk:false});
-    return {d,score:-sum+G.rng()*2};
-  }).sort((a,b)=>a.score-b.score);
-  const dests=destScored.slice(0,destCount(G)).map(s=>s.d);
-  return {houses,dests};
-}
-// ランダム目的地(難易度調整用)
-function randomDests(G,exclude){
-  const cands=destCandidates(G).filter(d=>!exclude.has(d.cell));
-  shuffle(cands,G.rng);
-  return cands.slice(0,destCount(G));
-}
+// --- セットアップ(v6): スタートの家はcornerHouses、目的地は家カード山札 ---
 
 // --- ドラフト ---
 const TRAIT_AI_SCORE={rsman:9,kyoho:8,kakeashi:7,tetsuota:7,ichiban:7,lucky:6,dorobo:6,bbass:6,yurei:6,akuno:5,
@@ -1450,29 +1476,22 @@ function aiDraftPick(G,pi,pack){
 // --- 配置 ---
 function aiPlace(G,pi){
   const p=G.players[pi];
+  const h=p.nextHome||p.houses[0];
+  const di=p.dests.findIndex((_,i)=>!p.usedDests.includes(i));
+  const destCell=di>=0?p.dests[di].cell:null;
   let best=null,bs=1e9;
   for(const ch of p.charHand){
     if(p.charHand.length-1<neededReserve(G,p))continue;
-    for(const h of p.houses){
-      for(let di=0;di<p.dests.length;di++){
-        if(p.usedDests.includes(di))continue;
-        const walkS=ch.trait==='gyuho'?1:ch.trait==='inou'?3:2;
-        const rideOk=!['uchujin','inou'].includes(ch.trait);
-        let t=estTurns(G,pi,h,p.dests[di].cell,{walkS,rideOk});
-        t+=(ch.pts-1)*0.5; // 高得点=扱いにくい
-        if(ch.trait==='chikoku')t+=2;
-        if(ch.trait==='byonin')t+=estTurns(G,pi,h,G.board.facilities.hospital,{rideOk})*0.5;
-        if(ch.trait==='ronin')t+=estTurns(G,pi,h,G.board.facilities.library,{rideOk})*0.5;
-        if(t<bs){bs=t;best={charId:ch.id,house:h,destIdx:di};}
-      }
-    }
+    const walkS=ch.trait==='gyuho'?1:ch.trait==='inou'?3:2;
+    const rideOk=!['uchujin','inou'].includes(ch.trait);
+    let t=destCell?estTurns(G,pi,h,destCell,{walkS,rideOk,noVeh:!rideOk}):0;
+    t+=(ch.pts-1)*0.5; // 高得点=扱いにくい
+    if(ch.trait==='chikoku')t+=2;
+    if(ch.trait==='byonin')t+=estTurns(G,pi,h,G.board.facilities.hospital,{rideOk})*0.5;
+    if(ch.trait==='ronin')t+=estTurns(G,pi,h,G.board.facilities.library,{rideOk})*0.5;
+    if(t<bs){bs=t;best={charId:ch.id};}
   }
-  // 保険: 全部ダメなら最初の合法手
-  if(!best){
-    const ch=p.charHand[0],h=p.houses[0];
-    const di=p.dests.findIndex((_,i)=>!p.usedDests.includes(i));
-    best={charId:ch.id,house:h,destIdx:di};
-  }
+  if(!best)best={charId:p.charHand[0].id};
   return best;
 }
 
@@ -1593,8 +1612,16 @@ function aiMove(G,pi){
   if(canDeclareArrive(G,pi))return {declare:true};
   const moves=allMoves(G,pi);
   if(moves.length===0)return null;
+  // 方向音痴が目的地の真上に居ると到着宣言できない: まず隣のマスへ一歩出る
+  if(a.card.trait==='hokohei'&&a.cell===a.dest){
+    const adj=roadNeighbors(G.board,a.dest).map(n2=>n2.cell);
+    const esc=moves.find(m2=>adj.includes(m2.cell)&&m2.mode==='walk')||moves.find(m2=>adj.includes(m2.cell));
+    if(esc)return {move:esc};
+  }
   let best=null,bs=1e9;
-  const reserveOk=p.charHand.length>neededReserve(G,p);
+  // 乗り物に乗れない特徴は配車前提の距離計算をしない(往復スタック防止)
+  const noVeh=['uchujin','inou'].includes(a.card.trait);
+  const reserveOk=!noVeh&&p.charHand.length>neededReserve(G,p);
   // 必須訪問先があればまずそこへ
   let goal=a.dest;
   for(const req of a.mustVisit){const k=req.split(':')[1];goal=G.board.facilities[k];break;}
@@ -1603,9 +1630,9 @@ function aiMove(G,pi){
     if(canArrive(G,pi,m.cell,m.path)){best=m;bs=-1;break;}
     // 到着できないのに自分の目的地マスに乗るのは無意味
     if(m.cell===a.dest&&goal===a.dest)continue;
-    let t=estTurns(G,pi,m.cell,goal,{rideOk:reserveOk});
+    let t=estTurns(G,pi,m.cell,goal,{rideOk:reserveOk,noVeh});
     // 訪問後に目的地へ向かう距離も薄く加味
-    if(goal!==a.dest)t+=estTurns(G,pi,goal,a.dest,{rideOk:reserveOk})*0.2;
+    if(goal!==a.dest)t+=estTurns(G,pi,goal,a.dest,{rideOk:reserveOk,noVeh})*0.2;
     if(m.mode==='ride'){
       t+=0.6; // キャラカードの重み
       if(p.fx.freeRide||p.actionHand.some(c=>c.key==='rsm_card'))t-=0.55;
@@ -1639,7 +1666,7 @@ function aiMove(G,pi){
   };
   const wrap=m=>!m?null:(m.mode==='ride'?{move:m,payment:ridePayFor()}:{move:m});
   // 現状より悪化しかしない場合の処理
-  const stay=estTurns(G,pi,a.cell,goal,{rideOk:reserveOk});
+  const stay=estTurns(G,pi,a.cell,goal,{rideOk:reserveOk,noVeh});
   if(best&&bs>=stay+0.9&&!canArrive(G,pi,best.cell,best.path)){
     const B=G.board;
     const atStop=B.busStopCells.includes(a.cell)||B.stations.includes(a.cell);
@@ -1763,14 +1790,14 @@ function seWin(){[523,659,784,1047,1319].forEach((f,i)=>SND.tone(f,0.3,{vol:0.12
 function saveGame(){
   try{
     if(!G||G.winner)return;
-    localStorage.setItem('rsg_save','{"human":'+HUMAN+',"g":'+gameToJSON(G)+'}');
+    localStorage.setItem('rsg_save6','{"human":'+HUMAN+',"g":'+gameToJSON(G)+'}');
   }catch(e){}
 }
-function clearSave(){try{localStorage.removeItem('rsg_save');}catch(e){}}
+function clearSave(){try{localStorage.removeItem('rsg_save6');}catch(e){}}
 function renderResume(){
   const el=$('resume');if(!el)return;
   let sv=null;
-  try{const raw=localStorage.getItem('rsg_save');if(raw)sv=gameFromJSON(raw);}catch(e){}
+  try{const raw=localStorage.getItem('rsg_save6');if(raw)sv=gameFromJSON(raw);}catch(e){}
   if(!sv||!sv.g||sv.g.winner){el.innerHTML='';return;}
   const mn={easy:'かんたん',normal:'ふつう',hard:'むずかしい'}[sv.g.mode]||'';
   el.innerHTML=`<button class="subbtn" id="btn-resume" style="border-color:#ffd54f;color:#ffd54f;margin-bottom:8px">▶ つづきから (${mn}・ターン${sv.g.turn})</button>`;
@@ -2187,10 +2214,10 @@ const MODES={
       <b>① キャラクタードラフト</b><br>
       7枚の束から1枚選んで残りを隣へ回す方式に。キャラの「特徴」と、家・目的地との相性で選ぶのが腕の見せどころ。<br><br>
       <b>② アクションカード</b><br>
-      毎ターン全員が<b>同時に</b>1枚出す(パスなら1枚引く)。使ったカードは引けず手札は最大5枚——ため込めないので使いどころが勝負。バス・電車・配車も<b>乗車にアクションカード1枚</b>が必要に。<br><br>
+      最初の手札は<b>2枚</b>+パス。毎ターン全員が<b>同時に</b>1枚出す(パスなら1枚引く)。手札は最大5枚——ため込めないので使いどころが勝負。バス・電車・配車も<b>乗車にアクションカード1枚</b>が必要に。<br><br>
       <b>③ 特殊マスドロー</b><br>
       🏥📚🏛🛒に止まるとカード1枚。寄り道にも価値が!<br><br>
-      目的地にはバス停や家も選ばれるように。<b>勝つと「むずかしい」が解放!</b></div>`],
+      目的地は<b>家カードの山札</b>で決定。着いた家は<b>自分の所有</b>になり、相手が止まると1枚引ける。<b>勝つと「むずかしい」が解放!</b></div>`],
   },
   hard:{name:'むずかしい',icon:'🔥',sub:'盤面そのものを武器にする',
     ncpuMax:3,sizeSel:true,smodeSel:true,dmodeSel:true,noActions:false,draft:true,destPool:'all',aiNoise:0,drawLuck:0.2,goalPts:18,
@@ -2201,7 +2228,7 @@ const MODES={
       <b>② デーカード</b><br>
       定期検診デー(60歳以上→病院)・自習デー(22歳以下→図書館)・補助金申請(23〜59歳→市役所)。<b>相手キャラの年齢を見て</b>足止めを仕掛けろ。<br><br>
       <b>③ ゲーム準備も勝負のうち</b><br>
-      「自分で選ぶ」にすると自分の家3軒を選び、<b>相手の目的地をあなたが指名</b>(原作ルール)。行きにくい場所へ送り込め!<br><br>
+      「自分で選ぶ」にすると<b>盤面四隅のスタートの家</b>を自分で選べる。最初の目的地は<b>全員共通</b>——先に着いて家を奪え!<br><br>
       CPU3人・19×19盤面も選択可。CPUも本気を出します。</div>`],
   },
 };
@@ -2326,18 +2353,21 @@ function onBoardTap(cell, wx, wy){
 let highlight={cells:new Set(),cls:'',labels:null}, pathPreview=null;
 // 自分の番のあいだ▼をくるくる動かす
 let pulseTimer=null,pulseCount=0;
-function startPulse(){pulseCount++;if(!pulseTimer)pulseTimer=setInterval(()=>draw(),55);}
+function startPulse(){pulseCount++;if(!pulseTimer)pulseTimer=setInterval(()=>draw(),33);}
 function stopPulse(){pulseCount=Math.max(0,pulseCount-1);
   if(!pulseCount&&pulseTimer){clearInterval(pulseTimer);pulseTimer=null;}draw();}
-function draw(){
-  if(!G)return;
-  const B=G.board, cv=$('board'), ctx=cv.getContext('2d');
+// ---- 静的盤面キャッシュ: 道路・路線・線路・家・駅は変化時のみオフスクリーンに描画 ----
+// (毎フレームの数百本のstroke+絵文字描画をdrawImage1回に置き換え、カクつきを除去)
+let BOARD_CACHE={cv:null,key:'',pad:8};
+function boardCacheKey(){
+  return [CV.cell,CV.dpr,G.boardStamp||0,G.rail?JSON.stringify(G.rail.edges):'',
+    G.players.map(p=>p.houses.join('.')).join('|')].join('#');
+}
+function drawBoardStatic(ctx){
+  const B=G.board;
   const C=CV.cell, P=CV.pad, N=B.W, S=C*N+P*2;
   const rr=(x,y,w,h,r)=>{ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();};
-  const _dpr=CV.dpr||1;
-  ctx.setTransform(1,0,0,1,0,0);
-  ctx.fillStyle='#e7ebef'; ctx.fillRect(0,0,cv.width,cv.height);
-  ctx.setTransform(_dpr*CAM.scale,0,0,_dpr*CAM.scale,_dpr*CAM.ox,_dpr*CAM.oy);
+  ctx.textAlign='center';ctx.textBaseline='middle';
   // 盤面背景(明るく静かに)
   ctx.fillStyle='#f3f5f7'; ctx.fillRect(-6,-6,S+12,S+12);
   // 交通空白(ごく薄い紫)
@@ -2463,6 +2493,29 @@ function draw(){
   };
   for(let i=0;i<B.stations.length;i++)tileBig(B.stations[i],'🚉','#e53935');
   for(const k in B.facilities)tileBig(B.facilities[k],FAC_INFO[k].icon,'#f59f00');
+}
+function draw(){
+  if(!G)return;
+  const B=G.board, cv=$('board'), ctx=cv.getContext('2d');
+  const C=CV.cell, P=CV.pad, N=B.W, S=C*N+P*2;
+  const rr=(x,y,w,h,r)=>{ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();};
+  const _dpr=CV.dpr||1;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#e7ebef'; ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.setTransform(_dpr*CAM.scale,0,0,_dpr*CAM.scale,_dpr*CAM.ox,_dpr*CAM.oy);
+  // 静的レイヤーはキャッシュから転写(盤面/所有者/線路が変わった時だけ再描画)
+  const _bkey=boardCacheKey(), _pad=BOARD_CACHE.pad;
+  if(BOARD_CACHE.key!==_bkey){
+    const os=Math.max(1,Math.min(2,2048/((S+_pad*2)*_dpr)));
+    const bc=BOARD_CACHE.cv||(BOARD_CACHE.cv=document.createElement('canvas'));
+    bc.width=Math.ceil((S+_pad*2)*_dpr*os); bc.height=Math.ceil((S+_pad*2)*_dpr*os);
+    const bctx=bc.getContext('2d');
+    bctx.setTransform(_dpr*os,0,0,_dpr*os,_pad*_dpr*os,_pad*_dpr*os);
+    drawBoardStatic(bctx);
+    BOARD_CACHE.key=_bkey;
+  }
+  ctx.drawImage(BOARD_CACHE.cv,-_pad,-_pad,S+_pad*2,S+_pad*2);
+  ctx.textAlign='center';ctx.textBaseline='middle';
   // 工事
   if(G.fx.kojiTurn===G.turn&&G.fx.kojiCell){const [x,y]=cellXY(G.fx.kojiCell);
     ctx.font=(C*0.7)+'px sans-serif';ctx.fillText('🚧',x,y);}
@@ -2964,7 +3017,6 @@ function renderModes(){
     inp.parentElement.style.display=(+inp.value<=(m.ncpuMax||1))?'':'none';
   $('opt-bsize').style.display=m.sizeSel?'':'none';
   $('opt-smode').style.display=m.smodeSel?'':'none';
-  $('opt-dmode').style.display=m.dmodeSel?'':'none';
 }
 function initTitle(){
   show('screen-title');
@@ -2997,7 +3049,6 @@ function initTitle(){
     if(MODE_SEL!=='easy')ncpu=Math.min(+document.querySelector('input[name=ncpu]:checked').value,m.ncpuMax||3);
     if(m.sizeSel)size=+document.querySelector('input[name=bsize]:checked').value;
     if(m.smodeSel)smode=document.querySelector('input[name=smode]:checked').value;
-    if(m.dmodeSel)dmode=document.querySelector('input[name=dmode]:checked').value;
     HINTS_ON=$('chk-guide').checked;
     await startGame(ncpu,size,dmode,smode,MODE_SEL);
   };
@@ -3091,7 +3142,7 @@ async function startGame(ncpu,size,dmode,smode,mode){
   SND.init();SND.syncBgm(true);
   await toast('ゲーム開始！');
   await hintOnce('goal','勝利条件',
-   `到着したキャラの<b>得点の合計が先に${G.goalPts||18}点</b>に届いた人の勝ち!(キャラは3〜5点)<br>`+
+   `到着したキャラの<b>得点の合計が先に${G.goalPts||18}点</b>に届いた人の勝ち!(キャラは3〜5点)${G.players.length>2?' 達成した人から順位が確定し、残り1人になったら終了。':''}<br>`+
    `上の表示は<b>現在の順位</b>(左が1位で、進行に応じて入れ替わります)。<b>◯/${G.goalPts||18}</b>=得点、<b>🎯あと◯</b>=目的地までの残りマス。<br>`+
    '盤面の<b>駒やプレイヤー表示をタップ</b>→特徴と目的地が見えます。困ったら画面上の<b>❓ボタン</b>!');
   gameLoop();
@@ -3109,100 +3160,52 @@ async function autoDraft(){
 
 // ---- セットアップ ----
 async function runSetup(){
-  const taken=new Set(); // 家+目的地に使われたセル
-  if(G.setupMode==='auto'){
-    for(const pi of turnOrder(G)){
-      const s=aiSetup(G,pi,taken);
-      s.houses.forEach(h=>taken.add(h));
-      G.players[pi].houses=s.houses;
-    }
-    for(const pi of turnOrder(G)){
-      const nxt=(pi+1)%G.players.length;
-      const d=(G.destMode==='random')?randomDests(G,taken):aiSetup(G,pi,taken).dests;
-      d.forEach(x=>taken.add(x.cell));
-      G.players[nxt].dests=d;
-    }
-    const hp0=G.players[HUMAN];
-    log(G,`あなたの目的地: ${hp0.dests.map(d=>d.label).join(' / ')}`);
-    refresh();
-    await modal(`<div class="ptitle">準備完了!</div>
-      <div class="sm" style="font-size:13px;line-height:1.9">
-      家と目的地は自動で決まりました。<br><br>
-      🏠 <b>あなたの家(赤い枠)</b>: ${hp0.houses.map(fmtCell).join('・')}<br>
-      🎯 <b>目的地(緑の点線◯)</b>: ${hp0.dests.map((d,i)=>NUMSYM[i]+d.label).join(' ')}<br><br>
-      3人のキャラを、家から目的地へ送り届けよう。</div>`,
-      [{label:'OK',value:1,cls:'primary'}]);
-    return;
-  }
+  const B=G.board;
+  // ルールv6: 家(目的地)ドラフト — 盤面四隅の家から1軒選んで所有。最初のキャラの出発地
+  const corners=cornerHouses(B);
+  const remaining=[...corners];
   for(const pi of turnOrder(G)){
     const p=G.players[pi];
-    // --- 家 ---
-    let houses=[];
-    if(!p.isHuman){
-      const s=aiSetup(G,pi,taken);
-      houses=s.houses;
-      houses.forEach(h=>taken.add(h));
-      p.houses=houses;
+    let pick=null;
+    if(p.isHuman&&G.setupMode!=='auto'&&remaining.length>1){
+      pick=await pickCell([...remaining],'スタートの家を選ぶ(盤面四隅の家)');
     }else{
-      const mode=await panelChoose('自分の家を3軒選びます',[
-        {label:'自分で選ぶ',sub:'盤面から3軒タップ',value:'manual'},
-        {label:'おまかせ',sub:'AIが便利な場所を選ぶ',value:'auto'}]);
-      if(mode==='auto'){
-        houses=aiSetup(G,pi,taken).houses;
-      }else{
-        for(let k=0;k<3;k++){
-          const free=G.board.houses.filter(h=>!taken.has(h)&&!houses.includes(h));
-          houses.push(await pickCell(free,`家を選ぶ (${k+1}/3)`));
-          p.houses=[...houses];draw();
-        }
+      let bs=1e9;
+      for(const h of remaining){
+        let t=99;
+        for(const s of B.stations)t=Math.min(t,estTurns(G,pi,h,s,{rideOk:true}));
+        t+=G.rng()*0.8;
+        if(t<bs){bs=t;pick=h;}
       }
-      houses.forEach(h=>taken.add(h));
-      p.houses=houses;
     }
+    if(!pick)pick=remaining[0];
+    remaining.splice(remaining.indexOf(pick),1);
+    p.houses=[pick]; p.nextHome=pick;
+    log(G,`${p.name}のスタートの家: ${fmtCell(pick)}`);
     refresh();
   }
-  // --- 目的地 ---
-  if(G.destMode==='random'){
-    for(const pi of turnOrder(G)){
-      G.players[pi].dests=randomDests(G,taken);
-      G.players[pi].dests.forEach(d=>taken.add(d.cell));
-    }
-    log(G,'目的地はランダムに決定された');
-  }else{
-    for(const pi of turnOrder(G)){
-      const p=G.players[pi];
-      const nxt=G.players[(pi+1)%G.players.length];
-      let dests=[];
-      if(!p.isHuman){
-        dests=aiSetup(G,pi,taken).dests;
-      }else{
-        const dmode2=await panelChoose(`${nxt.name}の目的地を${destCount(G)}つ指名します(意地悪に選ぼう)`,[
-          {label:'自分で選ぶ',sub:'盤面からタップ(駅・特殊施設・バス停・空き家)',value:'manual'},
-          {label:'おまかせ',value:'auto'}]);
-        if(dmode2==='auto')dests=aiSetup(G,pi,taken).dests;
-        else{
-          for(let k=0;k<destCount(G);k++){
-            const cands=destCandidates(G).filter(d=>!taken.has(d.cell)&&!dests.some(x=>x.cell===d.cell));
-            const labels=new Map(cands.map(d=>[d.cell,d.label.replace(/\(.*\)/,'')]));
-            const c=await pickCell(cands.map(d=>d.cell),`${nxt.name}の目的地 ${k+1}/${destCount(G)}`,false,labels);
-            dests.push(cands.find(d=>d.cell===c));
-          }
-        }
-      }
-      dests.forEach(d=>taken.add(d.cell));
-      nxt.dests=dests;
-      refresh();
-    }
-  }
-  const hp=G.players[HUMAN];
-  log(G,`あなたの目的地: ${hp.dests.map(d=>d.label).join(' / ')}`);
+  // 残りの四隅カードを山札に戻して切り直し、1枚引く=全員共通の最初の目的地
+  const mine=new Set(G.players.map(p=>p.houses[0]));
+  G.houseDeck=shuffle(B.houses.filter(h=>!mine.has(h)),G.rng);
+  const first=drawHouseCard(G);
+  for(const p of G.players)p.dests=[first];
+  log(G,`最初の目的地(全員共通): ${first.label}`);
   refresh();
+  const hp0=G.players[HUMAN];
+  await modal(`<div class="ptitle">準備完了!</div>
+    <div class="sm" style="font-size:13px;line-height:1.9">
+    🏠 <b>あなたのスタートの家</b>: ${fmtCell(hp0.houses[0])}(あなたの色の枠)<br>
+    🎯 <b>最初の目的地</b>: ${first.label}(緑の点線◯) — <b>全員共通</b>! 早い者勝ちです。<br><br>
+    目的地に着くとその家を<b>所有</b>(先着1人)し、次のキャラはその家から出発します。<br>
+    次の目的地は<b>家カードの山札</b>からランダムに決まります。${G.noActions?'':'<br>相手があなたの<b>所有する家に止まる</b>と、あなたがカードを1枚引けます。'}</div>`,
+    [{label:'OK',value:1,cls:'primary'}]);
 }
 
 // ---- ドラフト ----
 function mySetupSummary(){
   const p=G.players[HUMAN];
-  return `<div class="sm">🏠 あなたの家: ${p.houses.map(fmtCell).join('・')}<br>🎯 目的地: ${p.dests.map((d,i)=>NUMSYM[i]+d.label).join(' ')}</div>`;
+  const d=p.dests[p.dests.length-1];
+  return `<div class="sm">🏠 スタートの家: ${p.houses.map(fmtCell).join('・')}<br>🎯 最初の目的地(全員共通): ${d?d.label:''}</div>`;
 }
 async function runDraft(){
   makeDraftPacks(G);
@@ -3238,10 +3241,11 @@ async function gameLoop(){
     saveGame(); // ターン境界で自動セーブ(タイトルの「つづきから」で再開可)
     for(const pi of turnOrder(G)){
       const p=G.players[pi];
+      if(p.finishRank)continue; // 順位確定者はスキップ
       if(!(p.needsPlacement&&p.usedPts<(G.goalPts||18)&&p.charHand.length>0&&p.dests.some((d,i)=>!p.usedDests.includes(i))))continue;
       if(p.isHuman)await humanPlace(pi);
       else{
-        const pl=aiPlace(G,pi);placeCharacter(G,pi,pl.charId,pl.house,pl.destIdx);
+        const pl=aiPlace(G,pi);placeCharacter(G,pi,pl.charId);
         const cc=p.usedChars[p.usedChars.length-1];
         if(cc)await cardFX(charCardHTML(cc),p.name+'のキャラが出発',p.color);
       }
@@ -3253,6 +3257,7 @@ async function gameLoop(){
     const choices={};
     for(const pi of turnOrder(G)){
       const p=G.players[pi];
+      if(p.finishRank){choices[pi]={cardId:null};continue;} // 順位確定者はスキップ
       choices[pi]=p.isHuman?await humanAction(pi):aiChooseAction(G,pi);
     }
     const played=Object.entries(choices).filter(([pi,c])=>c.cardId);
@@ -3357,28 +3362,19 @@ async function gameLoop(){
 // ---- 配置 ----
 async function humanPlace(pi){
   const p=G.players[pi];
+  const di=p.dests.findIndex((_,i)=>!p.usedDests.includes(i));
+  const d=p.dests[di];
   const ch=await new Promise(res=>{
-    $('panel').innerHTML=`<div class="ptitle">出発させるキャラを選ぶ</div><div class="sm">残りの目的地: ${p.dests.filter((d,i)=>!p.usedDests.includes(i)).length}箇所 (盤面の緑◯) / 家は何度でも出発できます</div><div class="cards" id="dcards"></div>`;
+    $('panel').innerHTML=`<div class="ptitle">出発させるキャラを選ぶ</div><div class="sm">🏠 出発: ${fmtCell(p.nextHome||p.houses[0])} → 🎯 目的地: ${d?d.label:'?'} (緑の◯)</div><div class="cards" id="dcards"></div>`;
     const dc=$('dcards');
     for(const c of p.charHand){
-      const d=document.createElement('div');d.innerHTML=charCardHTML(c);
-      d.firstChild.onclick=()=>res(c);dc.appendChild(d.firstChild);
+      const dv=document.createElement('div');dv.innerHTML=charCardHTML(c);
+      dv.firstChild.onclick=()=>res(c);dc.appendChild(dv.firstChild);
     }
   });
   await hintOnce('place','キャラの配置',
-   '選んだキャラを家から出発させ、目的地(緑の◯)を1つ選びます。<br>キャラの特徴と目的地の位置の相性が大事です。');
-  const freeH=p.houses.filter(h=>!p.usedHouses.includes(h));
-  const house=freeH.length===1?freeH[0]:await pickCell(freeH,'出発する家を選ぶ');
-  // 目的地: 家選びと同じく盤面をタップして選ぶ
-  const unused=p.dests.map((d,i)=>({d,i})).filter(x=>!p.usedDests.includes(x.i));
-  let di;
-  if(unused.length===1)di=unused[0].i;
-  else{
-    const labels=new Map(unused.map(x=>[x.d.cell,NUMSYM[x.i]+x.d.label.replace(/\(.*\)/,'')]));
-    const c=await pickCell(unused.map(x=>x.d.cell),'目的地をタップして選ぶ',false,labels);
-    di=unused.find(x=>x.d.cell===c).i;
-  }
-  placeCharacter(G,pi,ch.id,house,di);
+   '選んだキャラが家から出発します(到着した家が次の出発地になります)。目的地への道のりとキャラの特徴の相性が大事です。');
+  placeCharacter(G,pi,ch.id);
   refresh();
 }
 
@@ -3584,7 +3580,7 @@ async function showResult(){
     setUnlock(3);
     await modal(`<div class="ptitle">🎊 「むずかしい」モード解放!</div>
       <div class="sm" style="font-size:13px;line-height:1.9">読み合いを制したあなたへ、最後のステージ。<br><br>
-      <b>盤面変更カード</b>で道路や線路そのものが動き、<b>デーカード</b>が年齢条件で足止めを仕掛け、ゲーム準備では<b>相手の目的地をあなたが指名</b>できます。<br>
+      <b>盤面変更カード</b>で道路や線路そのものが動き、<b>デーカード</b>が年齢条件で足止めを仕掛け、目的地は<b>家カードの山札</b>で決まり、着いた家は自分の所有になります。<br>
       地形・カード・準備、すべてが武器。CPUも本気です。<br><br>
       タイトル画面から「🔥むずかしい」へ!</div>`,[{label:'受けて立つ!',value:1,cls:'primary'}]);
   }
